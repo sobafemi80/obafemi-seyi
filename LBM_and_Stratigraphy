@@ -1,0 +1,732 @@
+"""
+2D LBM Turbidity Current Simulation with Exner Bed Evolution
+--------------------------------------------------------------
+D2Q9 fluid + D2Q5 scalar transport + Smagorinsky LES
+Morphodynamic coupling via deposition + erosion-driven bed evolution
+
+FIXES APPLIED (and nothing else changed in model intent):
+1) Proper moving-bed no-slip via link-wise bounce-back during STREAMING (D2Q9)
+2) Zero-normal-flux at bed for scalar via link-wise bounce-back (D2Q5)
+3) Removed per-cell array allocations inside collision (feq/fneq/Fi) for stability/performance
+   (same equations, just computed without allocating arrays per cell)
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.patches as patches
+import imageio
+from pathlib import Path
+import time
+from numba import jit, prange
+
+# =============================================================================
+# LATTICE DEFINITIONS
+# =============================================================================
+
+# D2Q9 velocities: [rest, E, W, N, S, NE, SW, NW, SE]
+E9 = np.array([
+    [0, 0],    # 0 - rest
+    [1, 0],    # 1 - E
+    [-1, 0],   # 2 - W
+    [0, 1],    # 3 - N
+    [0, -1],   # 4 - S
+    [1, 1],    # 5 - NE
+    [-1, -1],  # 6 - SW
+    [-1, 1],   # 7 - NW
+    [1, -1]    # 8 - SE
+], dtype=np.int32)
+
+# D2Q9 weights
+W9 = np.array([4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36], dtype=np.float64)
+
+# Opposite directions for bounce-back (D2Q9)
+OPP9 = np.array([0, 2, 1, 4, 3, 6, 5, 8, 7], dtype=np.int32)
+
+# D2Q5 for scalar transport: [rest(not used), E, W, N, S]
+E5 = np.array([
+    [0, 0],
+], dtype=np.int32)
+
+E5 = np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]], dtype=np.int32)
+OPP5 = np.array([0, 2, 1, 4, 3], dtype=np.int32)
+
+# =============================================================================
+# NUMBA-OPTIMIZED KERNELS
+# =============================================================================
+
+@jit(nopython=True, parallel=True)
+def stream_f_bb(f, f_tmp, E, OPP, solid, nx, nz):
+    """
+    Stream D2Q9 distributions with:
+    - open/outflow handled by clamping
+    - TOP free-slip handled by clamping
+    - moving-bed no-slip handled by link-wise bounce-back:
+        if the upstream neighbor is solid, reflect from local opposite direction
+    """
+    for k in prange(9):
+        ex, ez = E[k, 0], E[k, 1]
+        ok = OPP[k]
+        for x in range(nx):
+            for z in range(nz):
+                # if current node is solid, streaming value doesn't matter much
+                # (collision will overwrite), but keep it consistent
+                if solid[x, z]:
+                    f_tmp[k, x, z] = f[k, x, z]
+                    continue
+
+                xp = x - ex
+                zp = z - ez
+
+                # Domain boundaries (open / clamp)
+                if xp < 0:
+                    xp = 0
+                if xp >= nx:
+                    xp = nx - 1
+                if zp < 0:
+                    zp = 0
+                if zp >= nz:
+                    zp = nz - 1
+
+                # Link-wise bounce-back at solid boundary
+                if solid[xp, zp]:
+                    f_tmp[k, x, z] = f[ok, x, z]
+                else:
+                    f_tmp[k, x, z] = f[k, xp, zp]
+    return f_tmp
+
+
+@jit(nopython=True, parallel=True)
+def stream_C_bb(C, C_tmp, E5, OPP5, solid, nx, nz):
+    """
+    Stream D2Q5 scalar distributions with:
+    - open/outflow handled by clamping
+    - zero-normal-flux at bed via link-wise bounce-back:
+        if upstream neighbor is solid, reflect from local opposite direction
+    Note: We only store/stream k=1..4.
+    """
+    for k in prange(1, 5):
+        ex, ez = E5[k, 0], E5[k, 1]
+        ok = OPP5[k]
+        for x in range(nx):
+            for z in range(nz):
+                if solid[x, z]:
+                    C_tmp[k, x, z] = 0.0
+                    continue
+
+                xp = x - ex
+                zp = z - ez
+
+                if xp < 0:
+                    xp = 0
+                if xp >= nx:
+                    xp = nx - 1
+                if zp < 0:
+                    zp = 0
+                if zp >= nz:
+                    zp = nz - 1
+
+                if solid[xp, zp]:
+                    C_tmp[k, x, z] = C[ok, x, z]
+                else:
+                    C_tmp[k, x, z] = C[k, xp, zp]
+    return C_tmp
+
+
+@jit(nopython=True, parallel=True)
+def compute_moments(f, C, rho, ux, uz, con, solid, nx, nz):
+    """Compute macroscopic quantities"""
+    for x in prange(nx):
+        for z in range(nz):
+            if solid[x, z]:
+                rho[x, z] = 1.0
+                ux[x, z] = 0.0
+                uz[x, z] = 0.0
+                con[x, z] = 0.0
+            else:
+                r = (f[0,x,z] + f[1,x,z] + f[2,x,z] + f[3,x,z] +
+                     f[4,x,z] + f[5,x,z] + f[6,x,z] + f[7,x,z] + f[8,x,z])
+                rho[x, z] = r
+                c = C[1,x,z] + C[2,x,z] + C[3,x,z] + C[4,x,z]
+                con[x, z] = c
+
+                ux[x, z] = (f[1,x,z] - f[2,x,z] + f[5,x,z] - f[6,x,z] -
+                            f[7,x,z] + f[8,x,z]) / r
+                uz[x, z] = (f[3,x,z] - f[4,x,z] + f[5,x,z] - f[6,x,z] +
+                            f[7,x,z] - f[8,x,z]) / r
+    return rho, ux, uz, con
+
+
+@jit(nopython=True, parallel=True)
+def collide_bgk_les(f, C, rho, ux, uz, con, solid, eta, Dep, Ero,
+                    W, E, OPP, nx, nz, nu_lbm, nuC_lbm,
+                    C_smag, Sm_t, g_r, ws, dz, dt,
+                    tau_c, M_ero, slope):
+    """BGK collision with Smagorinsky LES, deposition AND erosion, WITH SLOPE"""
+    cs2 = 1.0 / 3.0
+    inv_cs4 = 1.0 / (cs2 * cs2)
+
+    for x in prange(nx):
+        zb = int(np.floor(eta[x] / dz))
+
+        for z in range(nz):
+            if solid[x, z]:
+                # Keep solid quiet; no-slip is enforced by streaming bounce-back
+                for k in range(9):
+                    f[k, x, z] = W[k]
+                for k in range(1, 5):
+                    C[k, x, z] = 0.0
+                continue
+
+            rho_loc = rho[x, z]
+            ux_loc = ux[x, z]
+            uz_loc = uz[x, z]
+            con_loc = con[x, z]
+
+            # Clamp concentration (safety)
+            if con_loc > 1.0:
+                con_loc = 1.0
+            if con_loc < 0.0:
+                con_loc = 0.0
+
+            # Buoyancy force WITH SLOPE
+            Fx = con_loc * g_r * slope
+            Fz = -con_loc * g_r
+
+            # Add half-force to velocity (Guo)
+            ux_loc += 0.5 * Fx / rho_loc
+            uz_loc += 0.5 * Fz / rho_loc
+
+            # Velocity limiting for stability
+            u_mag = np.sqrt(ux_loc*ux_loc + uz_loc*uz_loc)
+            u_max = 0.15
+            if u_mag > u_max:
+                sc = u_max / u_mag
+                ux_loc *= sc
+                uz_loc *= sc
+                u_mag = u_max
+
+            u2 = ux_loc*ux_loc + uz_loc*uz_loc
+
+            # --------- Compute non-equilibrium stress (Pi) without arrays ----------
+            Pi_xx = 0.0
+            Pi_xz = 0.0
+            Pi_zz = 0.0
+
+            for k in range(9):
+                ex = E[k, 0]
+                ez = E[k, 1]
+                eu = ux_loc * ex + uz_loc * ez
+                feq = W[k] * rho_loc * (1.0 + eu/cs2 + (eu*eu)/(2.0*cs2*cs2) - u2/(2.0*cs2))
+                fneq = f[k, x, z] - feq
+
+                # Build Pi components in the same way you were doing (D2Q9 mapping)
+                if k == 1 or k == 2 or k == 5 or k == 6 or k == 7 or k == 8:
+                    Pi_xx += fneq
+                if k == 3 or k == 4 or k == 5 or k == 6 or k == 7 or k == 8:
+                    Pi_zz += fneq
+                if k == 5 or k == 6:
+                    Pi_xz += fneq
+                if k == 7 or k == 8:
+                    Pi_xz -= fneq
+
+            Q = Pi_xx*Pi_xx + 2.0*Pi_xz*Pi_xz + Pi_zz*Pi_zz
+
+            # Smagorinsky turbulent viscosity
+            # (same formula you used; just no arrays)
+            nu_t = (1.0/6.0) * (np.sqrt(nu_lbm*nu_lbm + 18.0*C_smag*C_smag*np.sqrt(np.abs(Q))) - nu_lbm)
+            if nu_t < 0.0:
+                nu_t = 0.0
+
+            tau = 3.0 * (nu_lbm + nu_t) + 0.5
+            tau_C = 3.0 * (nuC_lbm + nu_t/Sm_t) + 0.5
+
+            omega_f = 1.0 / tau
+            omega_C = 1.0 / tau_C
+
+            # --------- Fluid collision (recompute feq, compute Fi on the fly) ----------
+            for k in range(9):
+                ex = float(E[k, 0])
+                ez = float(E[k, 1])
+                eu = ux_loc * ex + uz_loc * ez
+                feq = W[k] * rho_loc * (1.0 + eu/cs2 + (eu*eu)/(2.0*cs2*cs2) - u2/(2.0*cs2))
+
+                # Guo forcing
+                A1 = Fx * (ex/cs2 + inv_cs4 * ((ex*ex - cs2)*ux_loc + ex*ez*uz_loc))
+                A2 = Fz * (ez/cs2 + inv_cs4 * (ex*ez*ux_loc + (ez*ez - cs2)*uz_loc))
+                Fi = W[k] * (A1 + A2)
+
+                f[k, x, z] = f[k, x, z] - omega_f * (f[k, x, z] - feq) + (1.0 - 0.5*omega_f) * Fi
+
+            # --------- Scalar collision ----------
+            for k in range(1, 5):
+                ex = float(E5[k, 0])
+                ez = float(E5[k, 1])
+                eu = ux_loc * ex + uz_loc * ez
+                Ceq = 0.25 * con_loc * (1.0 + eu/cs2)
+                C[k, x, z] = C[k, x, z] - omega_C * (C[k, x, z] - Ceq)
+
+            # --------- Deposition + Erosion at interface ----------
+            if z == zb + 1:
+                # Deposition
+                D = ws * max(con_loc, 0.0)
+
+                # Erosion (shear proxy)
+                nu_eff = nu_lbm + nu_t
+                tau_b = rho_loc * nu_eff * u_mag / (0.5 * dz)
+
+                if (tau_b > tau_c) and (eta[x] > 0.01):
+                    E_flux = M_ero * (tau_b - tau_c)
+                else:
+                    E_flux = 0.0
+
+                # Limit erosion by available bed
+                max_E = eta[x] * (1.0 - 0.4) / dt * 0.5
+                if E_flux > max_E:
+                    E_flux = max_E
+
+                # Update concentration: -D + E
+                dC = (-D + E_flux) * dt / dz
+                con_new = con_loc + dC
+
+                if con_new < 0.0:
+                    D = (con_loc + E_flux * dt / dz) * dz / dt
+                    con_new = 0.0
+
+                # Update scalar distributions proportionally
+                if con_loc > 1e-10:
+                    ratio = con_new / con_loc
+                    if ratio < 0.0:
+                        ratio = 0.0
+                    for k in range(1, 5):
+                        C[k, x, z] *= ratio
+                elif E_flux > 0.0:
+                    added_con = E_flux * dt / dz
+                    for k in range(1, 5):
+                        C[k, x, z] = 0.25 * added_con
+
+                Dep[x] = D
+                Ero[x] = E_flux
+
+    return f, C, Dep, Ero
+
+
+@jit(nopython=True)
+def apply_outflow_bc(f, C, nx, nz):
+    """Zero-gradient outflow at right boundary (x = nx-1)"""
+    x = nx - 1
+    for z in range(nz):
+        for k in range(9):
+            f[k, x, z] = f[k, x-1, z]
+        for k in range(1, 5):
+            C[k, x, z] = C[k, x-1, z]
+    return f, C
+
+
+@jit(nopython=True)
+def apply_inlet_bc(f, C, rho, ux, uz, con, W, nx, nz,
+                   inlet_con, inlet_u, inlet_h, eta, dz):
+    """Apply inlet boundary condition (left side)"""
+    x = 0
+    zb = int(np.floor(eta[x] / dz))
+    cs2 = 1.0 / 3.0
+
+    # (Keep your local E definition to avoid changing intent)
+    E_local = np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1],
+                        [1, 1], [-1, -1], [-1, 1], [1, -1]], dtype=np.int32)
+
+    for z in range(max(0, zb+1), min(nz, zb + 1 + inlet_h)):
+        rho_in = 1.0
+        ux_in = inlet_u
+        uz_in = 0.0
+        con_in = inlet_con
+
+        u2 = ux_in*ux_in + uz_in*uz_in
+
+        for k in range(9):
+            eu = ux_in * E_local[k, 0] + uz_in * E_local[k, 1]
+            f[k, x, z] = W[k] * rho_in * (1.0 + eu/cs2 + eu*eu/(2.0*cs2*cs2) - u2/(2.0*cs2))
+
+        for k in range(1, 5):
+            ex = float(E5[k, 0])
+            ez = float(E5[k, 1])
+            eu = ux_in * ex + uz_in * ez
+            C[k, x, z] = 0.25 * con_in * (1.0 + eu/cs2)
+
+    return f, C
+
+
+@jit(nopython=True)
+def exner_update(eta, Dep, Ero, dt, poro, nz, dz):
+    """Update bed elevation via Exner equation with erosion"""
+    nx = len(eta)
+    for x in range(nx):
+        net_flux = Dep[x] - Ero[x]
+        eta[x] += dt * net_flux / (1.0 - poro)
+        if eta[x] < 0.0:
+            eta[x] = 0.0
+        if eta[x] > (nz - 3) * dz:
+            eta[x] = (nz - 3) * dz
+    return eta
+
+
+@jit(nopython=True)
+def update_solid_mask(solid, eta, dz, nx, nz):
+    """Update solid mask based on bed elevation"""
+    for x in range(nx):
+        zb = int(np.floor(eta[x] / dz))
+        for z in range(nz):
+            solid[x, z] = (z <= zb)
+    return solid
+
+# =============================================================================
+# SIMULATION CLASS
+# =============================================================================
+
+class TurbidityLBM2D:
+    """
+    2D Lattice Boltzmann simulation of turbidity currents
+    with morphodynamic bed evolution (Exner equation)
+    Includes EROSION via bed shear stress (proxy)
+    """
+    def __init__(self, nx=256, nz=96):
+        self.nx, self.nz = nx, nz
+
+        # Grid spacing
+        self.dz = 1.0
+        self.dt = 1.0
+
+        # Physical parameters (lattice units)
+        self.nu_lbm = 0.015
+        self.nuC_lbm = 0.015
+        self.Sm_t = 0.7
+        self.g_r = 5e-4
+        self.ws = 0.012
+        self.poro = 0.4
+        self.C_smag = 0.12
+
+        # Inlet conditions
+        self.inlet_con = 0.5
+        self.inlet_u = 0.08
+        self.inlet_h = 15
+        self.inlet_duration = 800
+
+        # Erosion parameters
+        self.tau_c = 0.001
+        self.M_ero = 0.05
+
+        # Slope parameter
+        self.slope = 0.0
+
+        self._init_arrays()
+
+    def _init_arrays(self):
+        nx, nz = self.nx, self.nz
+
+        self.f = np.zeros((9, nx, nz), dtype=np.float64)
+        self.f_tmp = np.zeros_like(self.f)
+
+        self.C = np.zeros((5, nx, nz), dtype=np.float64)
+        self.C_tmp = np.zeros_like(self.C)
+
+        self.rho = np.ones((nx, nz), dtype=np.float64)
+        self.ux = np.zeros((nx, nz), dtype=np.float64)
+        self.uz = np.zeros((nx, nz), dtype=np.float64)
+        self.con = np.zeros((nx, nz), dtype=np.float64)
+
+        self.eta = np.zeros(nx, dtype=np.float64)
+        self.Dep = np.zeros(nx, dtype=np.float64)
+        self.Ero = np.zeros(nx, dtype=np.float64)
+
+        self.solid = np.zeros((nx, nz), dtype=np.bool_)
+
+        # Initial equilibrium
+        for k in range(9):
+            self.f[k] = W9[k] * self.rho
+
+        update_solid_mask(self.solid, self.eta, self.dz, nx, nz)
+
+    def step(self, t):
+        nx, nz = self.nx, self.nz
+
+        self.Dep[:] = 0.0
+        self.Ero[:] = 0.0
+
+        # STREAM with proper bounce-back against moving bed
+        self.f_tmp = stream_f_bb(self.f, self.f_tmp, E9, OPP9, self.solid, nx, nz)
+        self.f, self.f_tmp = self.f_tmp, self.f
+
+        self.C_tmp = stream_C_bb(self.C, self.C_tmp, E5, OPP5, self.solid, nx, nz)
+        self.C, self.C_tmp = self.C_tmp, self.C
+
+        # Moments
+        self.rho, self.ux, self.uz, self.con = compute_moments(
+            self.f, self.C, self.rho, self.ux, self.uz, self.con,
+            self.solid, nx, nz
+        )
+
+        # Collision + deposition + erosion
+        self.f, self.C, self.Dep, self.Ero = collide_bgk_les(
+            self.f, self.C, self.rho, self.ux, self.uz, self.con,
+            self.solid, self.eta, self.Dep, self.Ero,
+            W9, E9, OPP9, nx, nz,
+            self.nu_lbm, self.nuC_lbm, self.C_smag, self.Sm_t,
+            self.g_r, self.ws, self.dz, self.dt,
+            self.tau_c, self.M_ero, self.slope
+        )
+
+        # Inlet BC
+        if t < self.inlet_duration:
+            self.f, self.C = apply_inlet_bc(
+                self.f, self.C, self.rho, self.ux, self.uz, self.con,
+                W9, nx, nz, self.inlet_con, self.inlet_u, self.inlet_h,
+                self.eta, self.dz
+            )
+
+        # Outflow BC
+        self.f, self.C = apply_outflow_bc(self.f, self.C, nx, nz)
+
+        # Exner update
+        self.eta = exner_update(self.eta, self.Dep, self.Ero, self.dt, self.poro, nz, self.dz)
+
+        # Update solid mask (moving bed)
+        self.solid = update_solid_mask(self.solid, self.eta, self.dz, nx, nz)
+
+    def run(self, n_steps=3000, output_every=60, output_dir="output"):
+        Path(output_dir).mkdir(exist_ok=True)
+        frames = []
+        eta_history = []
+
+        print(f"🌊 Running 2D LBM Turbidity Current Simulation")
+        print(f"   Grid: {self.nx} x {self.nz}")
+        print(f"   Steps: {n_steps}, Output every: {output_every}")
+        print(f"   Inlet duration: {self.inlet_duration} steps\n")
+
+        t_start = time.time()
+
+        for t in range(n_steps):
+            self.step(t)
+
+            if (t + 1) % output_every == 0:
+                self.rho, self.ux, self.uz, self.con = compute_moments(
+                    self.f, self.C, self.rho, self.ux, self.uz, self.con,
+                    self.solid, self.nx, self.nz
+                )
+
+                fig = self._make_frame(t + 1)
+                frame = np.array(fig.canvas.buffer_rgba())[:, :, :3]
+                frames.append(frame)
+                plt.close(fig)
+
+                eta_history.append(self.eta.copy())
+
+                elapsed = time.time() - t_start
+                mlups = (t + 1) * self.nx * self.nz / elapsed / 1e6
+
+                status = "🔵 INLET ON" if t < self.inlet_duration else "⚫ INLET OFF"
+                print(f"Step {t+1:5d} | η: [{self.eta.min():.2f}, {self.eta.max():.2f}] | "
+                      f"C_max: {self.con.max():.3f} | E_max: {self.Ero.max():.4f} | "
+                      f"{mlups:.1f} MLUPS | {status}")
+
+        gif_path = f"{output_dir}/turbidity_morphodynamics.gif"
+        imageio.mimsave(gif_path, frames, fps=10, loop=0)
+        print(f"\n✓ Saved animation: {gif_path}")
+
+        self._save_stratigraphy(output_dir, eta_history)
+        return gif_path
+
+    def _make_frame(self, step):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        fig.patch.set_facecolor('#0a0a0a')
+
+        colors_con = ['#0d1b2a', '#1b263b', '#415a77', '#778da9', '#e0e1dd']
+        cmap_con = LinearSegmentedColormap.from_list('sediment', colors_con)
+
+        colors_vel = ['#000000', '#1a1a2e', '#16213e', '#0f3460', '#e94560']
+        cmap_vel = LinearSegmentedColormap.from_list('velocity', colors_vel)
+
+        con_masked = self.con.T.copy()
+        vel_mag = np.sqrt(self.ux**2 + self.uz**2).T.copy()
+
+        for x in range(self.nx):
+            zb = int(np.floor(self.eta[x] / self.dz))
+            con_masked[:max(0, zb+1), x] = np.nan
+            vel_mag[:max(0, zb+1), x] = np.nan
+
+        ax1 = axes[0, 0]
+        ax1.set_facecolor('#0d1b2a')
+        im1 = ax1.imshow(con_masked, origin='lower', aspect='auto',
+                         cmap=cmap_con, vmin=0, vmax=0.5, extent=[0, self.nx, 0, self.nz])
+        ax1.fill_between(range(self.nx), 0, self.eta, color='saddlebrown', alpha=0.9)
+        ax1.plot(range(self.nx), self.eta, 'w-', lw=1.5)
+        ax1.set_xlim(0, self.nx)
+        ax1.set_ylim(0, self.nz)
+        ax1.set_xlabel('X (downstream)', color='white')
+        ax1.set_ylabel('Z (vertical)', color='white')
+        ax1.set_title(f'Sediment Concentration | Step {step}', color='white', fontsize=12)
+        ax1.tick_params(colors='white')
+        plt.colorbar(im1, ax=ax1, label='C')
+
+        if step <= self.inlet_duration:
+            inlet_patch = patches.Rectangle((0, 0), 3, self.inlet_h,
+                                            linewidth=2, edgecolor='cyan',
+                                            facecolor='cyan', alpha=0.3)
+            ax1.add_patch(inlet_patch)
+            ax1.text(5, self.inlet_h/2, 'INLET', color='cyan', fontsize=10, va='center')
+
+        ax2 = axes[0, 1]
+        ax2.set_facecolor('#1a1a2e')
+        im2 = ax2.imshow(vel_mag, origin='lower', aspect='auto',
+                         cmap=cmap_vel, vmin=0, extent=[0, self.nx, 0, self.nz])
+        ax2.fill_between(range(self.nx), 0, self.eta, color='saddlebrown', alpha=0.9)
+        ax2.plot(range(self.nx), self.eta, 'w-', lw=1.5)
+        ax2.set_xlim(0, self.nx)
+        ax2.set_ylim(0, self.nz)
+        ax2.set_xlabel('X (downstream)', color='white')
+        ax2.set_ylabel('Z (vertical)', color='white')
+        ax2.set_title('Velocity Magnitude |u|', color='white', fontsize=12)
+        ax2.tick_params(colors='white')
+        plt.colorbar(im2, ax=ax2, label='|u|')
+
+        ax3 = axes[1, 0]
+        ax3.set_facecolor('#1a1a1a')
+        ax3.fill_between(range(self.nx), 0, self.eta,
+                         color='saddlebrown', alpha=0.8, label='Bed')
+        ax3.plot(range(self.nx), self.eta, 'sandybrown', lw=2)
+        ax3.axhline(y=0, color='white', lw=0.5, ls='--', alpha=0.5)
+        ax3.set_xlim(0, self.nx)
+        y_range = max(5, abs(self.eta).max() * 1.3)
+        ax3.set_ylim(-y_range * 0.2, y_range)
+        ax3.set_xlabel('X (downstream)', color='white')
+        ax3.set_ylabel('Bed elevation η', color='white')
+        ax3.set_title(f'Bed Profile | η_min={self.eta.min():.2f}', color='white', fontsize=12)
+        ax3.tick_params(colors='white')
+        ax3.grid(True, alpha=0.2, color='white')
+        ax3.legend(loc='upper right', facecolor='#2a2a2a', edgecolor='white',
+                   labelcolor='white')
+
+        ax4 = axes[1, 1]
+        ax4.set_facecolor('#1a1a1a')
+        net_flux = self.Dep - self.Ero
+        ax4.bar(range(self.nx), np.maximum(net_flux, 0), width=1.0,
+                color='goldenrod', alpha=0.8, label='Deposition')
+        ax4.bar(range(self.nx), np.minimum(net_flux, 0), width=1.0,
+                color='crimson', alpha=0.8, label='Erosion')
+        ax4.axhline(y=0, color='white', lw=1, alpha=0.5)
+        ax4.set_xlim(0, self.nx)
+        flux_max = max(0.001, max(self.Dep.max(), self.Ero.max()) * 1.2)
+        ax4.set_ylim(-flux_max, flux_max)
+        ax4.set_xlabel('X (downstream)', color='white')
+        ax4.set_ylabel('Net flux (D - E)', color='white')
+        ax4.set_title('Deposition (+) vs Erosion (-)', color='white', fontsize=12)
+        ax4.tick_params(colors='white')
+        ax4.grid(True, alpha=0.2, color='white')
+        ax4.legend(loc='upper right', facecolor='#2a2a2a', edgecolor='white',
+                   labelcolor='white')
+
+        plt.tight_layout()
+        fig.canvas.draw()
+        return fig
+
+    def _save_stratigraphy(self, output_dir, eta_history):
+        fig, ax = plt.subplots(figsize=(14, 6))
+        fig.patch.set_facecolor('#0a0a0a')
+        ax.set_facecolor('#1a1a1a')
+
+        n_profiles = len(eta_history)
+        colors = plt.cm.plasma(np.linspace(0, 1, n_profiles))
+
+        all_eta = np.array(eta_history)
+        eta_min = all_eta.min()
+        eta_max = all_eta.max()
+
+        for i, eta in enumerate(eta_history):
+            ax.plot(range(self.nx), eta, color=colors[i], lw=1.2, alpha=0.9)
+
+        ax.fill_between(range(self.nx), 0, eta_history[-1],
+                        where=np.array(eta_history[-1]) >= 0,
+                        color='saddlebrown', alpha=0.4, label='Final deposit')
+
+        if eta_history[0].max() > 0:
+            ax.plot(range(self.nx), eta_history[0], 'w--', lw=2,
+                    alpha=0.7, label='Initial bed')
+
+        ax.axhline(y=0, color='white', lw=1, ls='-', alpha=0.5)
+
+        sm = plt.cm.ScalarMappable(cmap='plasma',
+                                   norm=plt.Normalize(0, n_profiles-1))
+        cbar = plt.colorbar(sm, ax=ax)
+        cbar.set_label('Time (relative)', color='white')
+        cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+        ax.set_xlabel('X (downstream)', fontsize=12, color='white')
+        ax.set_ylabel('Bed elevation η', fontsize=12, color='white')
+        ax.set_title('Stratigraphic Evolution - Cut & Fill Architecture',
+                     fontsize=14, color='white')
+        ax.tick_params(colors='white')
+        ax.grid(True, alpha=0.2, color='white')
+        ax.set_xlim(0, self.nx)
+        ax.set_ylim(min(-1, eta_min * 1.1), max(5, eta_max * 1.2))
+        ax.legend(loc='upper right', facecolor='#2a2a2a', edgecolor='white',
+                  labelcolor='white')
+
+        plt.tight_layout()
+        strat_path = f"{output_dir}/stratigraphy_evolution.png"
+        plt.savefig(strat_path, dpi=150, facecolor=fig.get_facecolor())
+        plt.close()
+        print(f"✓ Saved: {strat_path}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    sim = TurbidityLBM2D(nx=800, nz=200)
+
+    sim.nu_lbm = 0.004
+    sim.nuC_lbm = 0.004
+    sim.g_r = 1.5e-3
+    sim.ws = 0.006
+    sim.inlet_con = 0.35
+    sim.inlet_u = 0.08
+    sim.inlet_h = 100
+    sim.inlet_duration = 2500
+    sim.poro = 0.40
+
+    sim.slope = 0.012
+
+    sim.tau_c = 0.0003
+    sim.M_ero = 0.10
+
+    Re = sim.inlet_u * sim.inlet_h / sim.nu_lbm
+    Fr = sim.inlet_u / np.sqrt(sim.g_r * sim.inlet_h)
+    Ma = sim.inlet_u * np.sqrt(3.0)
+    tau = 3.0 * sim.nu_lbm + 0.5
+
+    print(f"\n>>> BALANCED TURBULENT + REALISTIC CONFIGURATION <<<")
+    print(f"    Re = {Re:.0f}  {'✅ TURBULENT!' if Re > 1000 else '⚠️ transitional'}")
+    print(f"    Fr = {Fr:.2f}  {'✅ realistic' if 0.3 < Fr < 2.0 else '⚠️ check'}")
+    print(f"    Ma = {Ma:.3f} (need < 0.3)")
+    print(f"    τ  = {tau:.4f} (need > 0.5)")
+    print(f"    slope = {sim.slope} ({sim.slope*100:.1f}% grade)")
+    print(f"    Grid: {sim.nx} × {sim.nz} = {sim.nx * sim.nz:,} cells\n")
+
+    initial_bed_height = 12.0
+    for x in range(sim.nx):
+        sim.eta[x] = initial_bed_height
+
+    update_solid_mask(sim.solid, sim.eta, sim.dz, sim.nx, sim.nz)
+
+    print(f"Initial bed: flat at η = {initial_bed_height}")
+    print(f"Erosion params: tau_c = {sim.tau_c}, M_ero = {sim.M_ero}")
+    print(f"Slope = {sim.slope} drives current forward!")
+
+    gif_path = sim.run(n_steps=4000, output_every=80, output_dir="output")
+
+    print(f"\n{'='*60}")
+    print(f"✓ Simulation complete!")
+    print(f"  Animation: {gif_path}")
+    print(f"  Stratigraphy: output/stratigraphy_evolution.png")
+    print(f"{'='*60}")
